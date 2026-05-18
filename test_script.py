@@ -1,7 +1,7 @@
 """
 test_script.py  —  Milestone 2 Test / Inference Script
 =======================================================
-Loads the 3 saved trained models from artifacts/models/ and makes
+Loads all 5 saved trained models from artifacts/models/ and makes
 predictions on a new (unseen) test CSV file WITHOUT re-training.
 
 Models supported:
@@ -10,6 +10,8 @@ Models supported:
     3. Stacked Ensemble       (artifacts/models/stacked_ensemble.pkl)
        base: LightGBM + XGBoost + Random Forest + Extra Trees
        meta: XGBoost
+    4. Logistic Regression    (artifacts/models/logistic_regression.pkl)
+    5. SVM (LinearSVC)        (artifacts/models/svm.pkl)
 
 Usage:
     python test_script.py  path/to/test_data.csv
@@ -20,6 +22,8 @@ Notes:
     - Every feature name matches the training script exactly.
     - Missing value handling: any column absent from the test CSV is
       filled with 0 before imputation — no row is ever dropped.
+    - LR and SVM require StandardScaler — the saved scaler from training
+      is loaded from the .pkl artifact and applied automatically.
 
 Outputs:
     - Console  : per-model accuracy + classification report (if labels exist)
@@ -47,12 +51,12 @@ MODELS_DIR  = "artifacts/models"
 OUTPUT_CSV  = "predictions_output.csv"
 CLASS_ORDER = ["Low", "Medium", "High"]
 
-LOW_THRESH  = 100    # RecommendationCount thresholds — identical to training
+LOW_THRESH  = 100
 HIGH_THRESH = 1000
 
 
 # =============================================================================
-# BLOCK 3 — PREPROCESSING  (identical to training script)
+# PREPROCESSING  (identical to training script)
 # =============================================================================
 
 def preprocessing(df: pd.DataFrame) -> pd.DataFrame:
@@ -108,7 +112,7 @@ def preprocessing(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
-# BLOCK 5 — FEATURE ENGINEERING  (identical column names to training script)
+# FEATURE ENGINEERING  (identical column names to training script)
 # =============================================================================
 
 def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
@@ -184,7 +188,7 @@ def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
         "LoggedPublisherCount":   np.log1p(df.get("PublisherCount",              pd.Series(0, index=df.index))),
         "LoggedDemoCount":        np.log1p(df.get("DemoCount",                   pd.Series(0, index=df.index))),
         "LoggedContentScore":     (
-            np.log1p(df.get("MovieCount",      pd.Series(0, index=df.index)))
+            np.log1p(df.get("MovieCount",        pd.Series(0, index=df.index)))
             + np.log1p(df.get("ScreenshotCount", pd.Series(0, index=df.index)))
             + np.log1p(df.get("DLCCount",        pd.Series(0, index=df.index)))
         ),
@@ -301,19 +305,16 @@ def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
 def align_and_impute(X_test: pd.DataFrame, imputer) -> pd.DataFrame:
     """
     Aligns the test feature matrix to the exact columns the imputer
-    was fitted on during training.
-    Any column that is completely missing from the test set is filled
-    with 0 (then the imputer replaces NaN with training medians).
+    was fitted on during training. Any column completely missing from
+    the test set is filled with 0 before the imputer applies medians.
     This guarantees no test row is ever dropped.
     """
     if hasattr(imputer, "feature_names_in_"):
         train_cols = list(imputer.feature_names_in_)
     else:
-        # Fallback: imputer was fitted without column names (numpy array path)
         train_cols = list(range(imputer.statistics_.shape[0]))
 
     X_aligned = X_test.reindex(columns=train_cols, fill_value=0)
-
     X_imp = pd.DataFrame(
         imputer.transform(X_aligned),
         columns=train_cols,
@@ -323,13 +324,32 @@ def align_and_impute(X_test: pd.DataFrame, imputer) -> pd.DataFrame:
 
 
 # =============================================================================
+# HELPER — align imputed features to scaler columns then scale
+# =============================================================================
+
+def align_and_scale(X_imp: pd.DataFrame, scaler) -> np.ndarray:
+    """
+    Aligns the imputed feature matrix to the exact columns the scaler
+    was fitted on during training, then applies transform().
+    Used by Logistic Regression and SVM which require scaled input.
+    """
+    if hasattr(scaler, "feature_names_in_"):
+        scaler_cols = list(scaler.feature_names_in_)
+    else:
+        # Fallback: scaler was fitted on a numpy array — column count must match
+        scaler_cols = X_imp.columns.tolist()
+
+    X_aligned = X_imp.reindex(columns=scaler_cols, fill_value=0)
+    return scaler.transform(X_aligned)
+
+
+# =============================================================================
 # HELPER — derive ground truth from whichever column is available
 # =============================================================================
 
 def get_ground_truth(df_test: pd.DataFrame):
     """
     Returns (y_true_encoded, label_encoder, valid_mask).
-    valid_mask is always None here (all rows are valid after dropna guard).
     Returns (None, None, None) if no label column exists.
     """
     le_gt = LabelEncoder()
@@ -360,6 +380,37 @@ def get_ground_truth(df_test: pd.DataFrame):
 
 
 # =============================================================================
+# HELPER — shared evaluation and reporting logic
+# =============================================================================
+
+def evaluate_and_report(y_true, preds_enc, valid_mask, has_labels,
+                        model_name, infer_time, all_summary):
+    """
+    Prints accuracy + classification report if ground truth is available.
+    Appends a summary row to all_summary either way.
+    """
+    print(f"  Inference time : {infer_time*1000:.3f} ms")
+    if has_labels:
+        preds_for_eval = preds_enc[valid_mask] if valid_mask is not None else preds_enc
+        acc = accuracy_score(y_true, preds_for_eval)
+        print(f"  Accuracy       : {acc:.4f}  ({acc*100:.2f}%)")
+        print()
+        print(classification_report(y_true, preds_for_eval,
+                                    target_names=CLASS_ORDER, zero_division=0))
+        all_summary.append({
+            "Model":           model_name,
+            "Accuracy":        f"{acc*100:.2f}%",
+            "Inference (ms)":  f"{infer_time*1000:.3f}",
+        })
+    else:
+        all_summary.append({
+            "Model":           model_name,
+            "Accuracy":        "N/A",
+            "Inference (ms)":  f"{infer_time*1000:.3f}",
+        })
+
+
+# =============================================================================
 # MAIN PREDICTION FUNCTION
 # =============================================================================
 
@@ -368,6 +419,7 @@ def predict_on_new_data(test_csv_path: str):
     print("=" * 65)
     print("  MILESTONE 2 — TEST / INFERENCE SCRIPT")
     print("  Models: LightGBM | Gradient Boosting | Stacked Ensemble")
+    print("          Logistic Regression | SVM (LinearSVC)")
     print("=" * 65)
 
     # ── 1. Load & prepare test data ───────────────────────────────────────────
@@ -390,7 +442,6 @@ def predict_on_new_data(test_csv_path: str):
     # ── 3. Output dataframe scaffold ──────────────────────────────────────────
     query_ids  = df_test["QueryID"].values if "QueryID" in df_test.columns else df_test.index
     results_df = pd.DataFrame({"QueryID": query_ids})
-
     all_summary = []
 
     # =========================================================================
@@ -416,20 +467,8 @@ def predict_on_new_data(test_csv_path: str):
         lgb_preds_lbl = lgb_art["label_encoder"].inverse_transform(lgb_preds_enc)
         results_df["LightGBM_Prediction"] = lgb_preds_lbl
 
-        print(f"  Inference time : {infer_time*1000:.3f} ms")
-        if has_labels:
-            preds_for_eval = lgb_preds_enc[valid_mask] if valid_mask is not None else lgb_preds_enc
-            acc = accuracy_score(y_true, preds_for_eval)
-            print(f"  Accuracy       : {acc:.4f}  ({acc*100:.2f}%)")
-            print()
-            print(classification_report(y_true, preds_for_eval,
-                                        target_names=CLASS_ORDER, zero_division=0))
-            all_summary.append({"Model": "LightGBM",
-                                 "Accuracy": f"{acc*100:.2f}%",
-                                 "Inference (ms)": f"{infer_time*1000:.3f}"})
-        else:
-            all_summary.append({"Model": "LightGBM", "Accuracy": "N/A",
-                                 "Inference (ms)": f"{infer_time*1000:.3f}"})
+        evaluate_and_report(y_true, lgb_preds_enc, valid_mask,
+                             has_labels, "LightGBM", infer_time, all_summary)
 
     # =========================================================================
     # MODEL 2 — Gradient Boosting
@@ -454,20 +493,8 @@ def predict_on_new_data(test_csv_path: str):
         gb_preds_lbl = gb_art["label_encoder"].inverse_transform(gb_preds_enc)
         results_df["GradientBoosting_Prediction"] = gb_preds_lbl
 
-        print(f"  Inference time : {infer_time*1000:.3f} ms")
-        if has_labels:
-            preds_for_eval = gb_preds_enc[valid_mask] if valid_mask is not None else gb_preds_enc
-            acc = accuracy_score(y_true, preds_for_eval)
-            print(f"  Accuracy       : {acc:.4f}  ({acc*100:.2f}%)")
-            print()
-            print(classification_report(y_true, preds_for_eval,
-                                        target_names=CLASS_ORDER, zero_division=0))
-            all_summary.append({"Model": "Gradient Boosting",
-                                 "Accuracy": f"{acc*100:.2f}%",
-                                 "Inference (ms)": f"{infer_time*1000:.3f}"})
-        else:
-            all_summary.append({"Model": "Gradient Boosting", "Accuracy": "N/A",
-                                 "Inference (ms)": f"{infer_time*1000:.3f}"})
+        evaluate_and_report(y_true, gb_preds_enc, valid_mask,
+                             has_labels, "Gradient Boosting", infer_time, all_summary)
 
     # =========================================================================
     # MODEL 3 — Stacked Ensemble  (LGB + XGB + RF + ET → XGB meta-learner)
@@ -483,10 +510,8 @@ def predict_on_new_data(test_csv_path: str):
         with open(stack_path, "rb") as f:
             stack_art = pickle.load(f)
 
-        # All 4 base models share the same imputer
         X_imp = align_and_impute(X_test, stack_art["imputer"])
 
-        # Each base model: 3 class probabilities → hstack = 12 meta-features
         print("  Running base models ...")
         t0 = time.time()
         meta_feats = np.hstack([
@@ -513,6 +538,68 @@ def predict_on_new_data(test_csv_path: str):
         else:
             all_summary.append({"Model": "Stacked Ensemble", "Accuracy": "N/A",
                                  "Inference (ms)": f"{infer_time*1000:.3f}"})
+
+    # =========================================================================
+    # MODEL 4 — Logistic Regression
+    # =========================================================================
+    lr_path = os.path.join(MODELS_DIR, "logistic_regression.pkl")
+    print("\n" + "-" * 65)
+    print("  [Model 4] Logistic Regression")
+    print("-" * 65)
+
+    if not os.path.exists(lr_path):
+        print(f"  File not found: {lr_path}  — Skipping.")
+    else:
+        with open(lr_path, "rb") as f:
+            lr_art = pickle.load(f)
+
+        # Step 1: impute using training medians
+        X_imp = align_and_impute(X_test, lr_art["imputer"])
+
+        # Step 2: scale using the StandardScaler fitted during training
+        # LR requires standardised features — the scaler is saved in the artifact
+        X_scaled = align_and_scale(X_imp, lr_art["scaler"])
+
+        t0           = time.time()
+        lr_preds_enc = lr_art["model"].predict(X_scaled)
+        infer_time   = time.time() - t0
+
+        lr_preds_lbl = lr_art["label_encoder"].inverse_transform(lr_preds_enc)
+        results_df["LogisticRegression_Prediction"] = lr_preds_lbl
+
+        evaluate_and_report(y_true, lr_preds_enc, valid_mask,
+                             has_labels, "Logistic Regression", infer_time, all_summary)
+
+    # =========================================================================
+    # MODEL 5 — SVM (LinearSVC)
+    # =========================================================================
+    svm_path = os.path.join(MODELS_DIR, "svm.pkl")
+    print("\n" + "-" * 65)
+    print("  [Model 5] SVM (LinearSVC)")
+    print("-" * 65)
+
+    if not os.path.exists(svm_path):
+        print(f"  File not found: {svm_path}  — Skipping.")
+    else:
+        with open(svm_path, "rb") as f:
+            svm_art = pickle.load(f)
+
+        # Step 1: impute using training medians
+        X_imp = align_and_impute(X_test, svm_art["imputer"])
+
+        # Step 2: scale using the same StandardScaler saved in the artifact
+        # SVM requires standardised features for correct margin computation
+        X_scaled = align_and_scale(X_imp, svm_art["scaler"])
+
+        t0            = time.time()
+        svm_preds_enc = svm_art["model"].predict(X_scaled)
+        infer_time    = time.time() - t0
+
+        svm_preds_lbl = svm_art["label_encoder"].inverse_transform(svm_preds_enc)
+        results_df["SVM_Prediction"] = svm_preds_lbl
+
+        evaluate_and_report(y_true, svm_preds_enc, valid_mask,
+                             has_labels, "SVM (LinearSVC)", infer_time, all_summary)
 
     # =========================================================================
     # SUMMARY TABLE + SAVE PREDICTIONS

@@ -824,6 +824,202 @@ def main():
         pickle.dump(stack_artifact, f)
     print(f"  Saved model -> {MODELS_DIR}/stacked_ensemble.pkl")
 
+
+    # -------------------------------------------------------------------------------------------------------------------#
+    # Model 4 : Logistic Regression
+    # -------------------------------------------------------------------------------------------------------------------#
+    print("\n" + "=" * 65)
+    print("  MODEL 4: Logistic Regression")
+    print("=" * 65)
+
+    # Logistic Regression needs scaled features — we scale the imputed matrix here.
+    # StandardScaler is fit on train only to prevent leakage into test.
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+
+    scaler_lr = StandardScaler()
+    X_train_scaled = scaler_lr.fit_transform(X_train_imputed)
+    X_test_scaled = scaler_lr.transform(X_test_imputed)
+
+    # --- Hyperparameter 1: C (inverse regularization strength) ---
+    # C controls how strongly regularization penalizes large coefficients.
+    # Small C = strong regularization (underfits), Large C = weak regularization (overfits).
+    # We fix solver='lbfgs' while varying C.
+    FIXED_LR_SOLVER = "lbfgs"
+    lr_C_values = [0.01, 0.1, 1.0, 10.0, 100.0]
+    lr_C_cv = []
+    print(f"\n  Tuning C (solver fixed = {FIXED_LR_SOLVER}):")
+    for c in lr_C_values:
+        lr = LogisticRegression(C=c, solver=FIXED_LR_SOLVER,
+                                max_iter=1000, random_state=RANDOM_STATE)
+        score = cross_val_score(lr, X_train_scaled, y_train,
+                                cv=kfold, scoring="accuracy").mean()
+        lr_C_cv.append(score)
+        print(f"    C={c:<8}  CV Accuracy = {score:.4f}")
+    best_lr_C = lr_C_values[int(np.argmax(lr_C_cv))]
+    plot_hyperparameter_effect(
+        "C (Regularization)", lr_C_values, lr_C_cv,
+        "Logistic Regression", f"{PLOTS_DIR}/lr_tune_C.png"
+    )
+    tuning_records["LogisticRegression_C"] = {
+        "values": lr_C_values, "cv_acc": lr_C_cv, "best": best_lr_C
+    }
+
+    # --- Hyperparameter 2: solver ---
+    # Different solvers use different optimization algorithms.
+    # lbfgs: limited-memory BFGS quasi-Newton method, good for multiclass.
+    # saga: stochastic average gradient, supports L1/L2, fast on large datasets.
+    # newton-cg: Newton conjugate gradient, good for multiclass.
+    # We fix C at the best value found above while varying solver.
+    lr_solver_values = ["lbfgs", "saga", "newton-cg"]
+    lr_solver_cv = []
+    print(f"\n  Tuning solver (C fixed = {best_lr_C}):")
+    for solver in lr_solver_values:
+        lr = LogisticRegression(C=best_lr_C, solver=solver,
+                                max_iter=1000, random_state=RANDOM_STATE)
+        score = cross_val_score(lr, X_train_scaled, y_train,
+                                cv=kfold, scoring="accuracy").mean()
+        lr_solver_cv.append(score)
+        print(f"    solver={solver:<12}  CV Accuracy = {score:.4f}")
+    best_lr_solver = lr_solver_values[int(np.argmax(lr_solver_cv))]
+    plot_hyperparameter_effect(
+        "solver", lr_solver_values, lr_solver_cv,
+        "Logistic Regression", f"{PLOTS_DIR}/lr_tune_solver.png"
+    )
+    tuning_records["LogisticRegression_solver"] = {
+        "values": lr_solver_values, "cv_acc": lr_solver_cv, "best": best_lr_solver
+    }
+
+    # --- Final Logistic Regression Model ---
+    print(f"\n  Best hyperparams: C={best_lr_C}, solver={best_lr_solver}")
+    lr_model = LogisticRegression(C=best_lr_C, solver=best_lr_solver,
+                                  max_iter=1000, random_state=RANDOM_STATE)
+    t0 = time.time()
+    lr_model.fit(X_train_scaled, y_train)
+    lr_train_time = time.time() - t0
+
+    t0 = time.time()
+    lr_pred = lr_model.predict(X_test_scaled)
+    lr_test_time = time.time() - t0
+
+    lr_m = compute_clf_metrics(y_test, lr_pred, le, "Logistic Regression",
+                               lr_train_time, lr_test_time)
+    all_results.append(lr_m)
+    print(f"  Train time: {lr_train_time:.4f}s  |  Test time: {lr_test_time * 1000:.3f}ms")
+    print(f"  Test Accuracy: {lr_m['accuracy_%']:.2f}%")
+    print(classification_report(y_test, lr_pred, target_names=CLASS_ORDER, zero_division=0))
+
+    plot_confusion_matrix(y_test, lr_pred, le,
+                          "Logistic Regression",
+                          f"{PLOTS_DIR}/lr_confusion_matrix.png")
+
+    # Save model — include scaler because LR requires scaled input at test time
+    lr_artifact = {
+        "model": lr_model,
+        "scaler": scaler_lr,
+        "imputer": imputer,
+        "label_encoder": le,
+    }
+    with open(f"{MODELS_DIR}/logistic_regression.pkl", "wb") as f:
+        pickle.dump(lr_artifact, f)
+    print(f"  Saved model -> {MODELS_DIR}/logistic_regression.pkl")
+
+    # -------------------------------------------------------------------------------------------------------------------#
+    # Model 5 : Support Vector Machine (SVM)
+    # -------------------------------------------------------------------------------------------------------------------#
+    print("\n" + "=" * 65)
+    print("  MODEL 5: Support Vector Machine (SVM)")
+    print("=" * 65)
+
+    # SVM also requires scaled features.
+    # We reuse X_train_scaled / X_test_scaled that were already created for LR above.
+    # LinearSVC is used instead of SVC(kernel='rbf') because:
+    #   - The dataset has ~9000 rows and 110 features → LinearSVC is much faster.
+    #   - LinearSVC uses a one-vs-rest multiclass strategy by default.
+    from sklearn.svm import LinearSVC
+    from sklearn.calibration import CalibratedClassifierCV
+
+    # --- Hyperparameter 1: C (regularization) ---
+    # Same interpretation as Logistic Regression: smaller C = more regularization.
+    # We fix max_iter=3000 while varying C.
+    FIXED_SVM_ITER = 3000
+    svm_C_values = [0.001, 0.01, 0.1, 1.0, 10.0]
+    svm_C_cv = []
+    print(f"\n  Tuning C (max_iter fixed = {FIXED_SVM_ITER}):")
+    for c in svm_C_values:
+        svm = LinearSVC(C=c, max_iter=FIXED_SVM_ITER, random_state=RANDOM_STATE)
+        score = cross_val_score(svm, X_train_scaled, y_train,
+                                cv=kfold, scoring="accuracy").mean()
+        svm_C_cv.append(score)
+        print(f"    C={c:<8}  CV Accuracy = {score:.4f}")
+    best_svm_C = svm_C_values[int(np.argmax(svm_C_cv))]
+    plot_hyperparameter_effect(
+        "C (Regularization)", svm_C_values, svm_C_cv,
+        "SVM (LinearSVC)", f"{PLOTS_DIR}/svm_tune_C.png"
+    )
+    tuning_records["SVM_C"] = {
+        "values": svm_C_values, "cv_acc": svm_C_cv, "best": best_svm_C
+    }
+
+    # --- Hyperparameter 2: max_iter ---
+    # max_iter controls how many optimization iterations the solver runs.
+    # Too few → model may not converge. Too many → slower with no gain.
+    # We fix C at best value while varying max_iter.
+    svm_iter_values = [500, 1000, 3000]
+    svm_iter_cv = []
+    print(f"\n  Tuning max_iter (C fixed = {best_svm_C}):")
+    for it in svm_iter_values:
+        svm = LinearSVC(C=best_svm_C, max_iter=it, random_state=RANDOM_STATE)
+        score = cross_val_score(svm, X_train_scaled, y_train,
+                                cv=kfold, scoring="accuracy").mean()
+        svm_iter_cv.append(score)
+        print(f"    max_iter={it:<5}  CV Accuracy = {score:.4f}")
+    best_svm_iter = svm_iter_values[int(np.argmax(svm_iter_cv))]
+    plot_hyperparameter_effect(
+        "max_iter", svm_iter_values, svm_iter_cv,
+        "SVM (LinearSVC)", f"{PLOTS_DIR}/svm_tune_max_iter.png"
+    )
+    tuning_records["SVM_max_iter"] = {
+        "values": svm_iter_values, "cv_acc": svm_iter_cv, "best": best_svm_iter
+    }
+
+    # --- Final SVM Model ---
+    # CalibratedClassifierCV wraps LinearSVC to give it predict_proba() capability.
+    # This is needed so the saved model can produce probabilities if required.
+    print(f"\n  Best hyperparams: C={best_svm_C}, max_iter={best_svm_iter}")
+    svm_base = LinearSVC(C=best_svm_C, max_iter=best_svm_iter, random_state=RANDOM_STATE)
+    svm_model = CalibratedClassifierCV(svm_base, cv=3)
+
+    t0 = time.time()
+    svm_model.fit(X_train_scaled, y_train)
+    svm_train_time = time.time() - t0
+
+    t0 = time.time()
+    svm_pred = svm_model.predict(X_test_scaled)
+    svm_test_time = time.time() - t0
+
+    svm_m = compute_clf_metrics(y_test, svm_pred, le, "SVM (LinearSVC)",
+                                svm_train_time, svm_test_time)
+    all_results.append(svm_m)
+    print(f"  Train time: {svm_train_time:.4f}s  |  Test time: {svm_test_time * 1000:.3f}ms")
+    print(f"  Test Accuracy: {svm_m['accuracy_%']:.2f}%")
+    print(classification_report(y_test, svm_pred, target_names=CLASS_ORDER, zero_division=0))
+
+    plot_confusion_matrix(y_test, svm_pred, le,
+                          "SVM (LinearSVC)",
+                          f"{PLOTS_DIR}/svm_confusion_matrix.png")
+
+    # Save model — include scaler (same one used for LR, reuse is fine)
+    svm_artifact = {
+        "model": svm_model,
+        "scaler": scaler_lr,  # same StandardScaler fitted on train
+        "imputer": imputer,
+        "label_encoder": le,
+    }
+    with open(f"{MODELS_DIR}/svm.pkl", "wb") as f:
+        pickle.dump(svm_artifact, f)
+    print(f"  Saved model -> {MODELS_DIR}/svm.pkl")
+
     #-------------------------------------------------------------------------------------------------------------------#
     #Bar Graphs
     #-------------------------------------------------------------------------------------------------------------------#
